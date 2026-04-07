@@ -20,6 +20,7 @@ Scale strategy:
 from leadgen.config import GOOGLE_MAPS_API_KEY, log
 from leadgen.email_scraper import scrape_email_from_website
 from leadgen.exporter import export_to_csv, export_to_jsonl, to_records
+from leadgen.cities import get_cities
 
 
 # ---------------------------------------------------------------------------
@@ -28,10 +29,20 @@ from leadgen.exporter import export_to_csv, export_to_jsonl, to_records
 
 def _sub_queries(keyword: str, location: str) -> list[str]:
     """
-    Return a list of search queries that together cover more of the location.
-    The first entry is always the plain query; the rest are progressively
-    more specific, used only when the plain search falls short of max_results.
+    Return an ordered list of search queries to run until max_results is hit.
+
+    Strategy:
+      - If location is a known country → iterate city by city (5 000+ scale)
+      - Otherwise → direction/modifier variants of the same location (city scale)
     """
+    cities = get_cities(location)
+
+    if cities:
+        # Country-level: one query per city, e.g. "restaurant Ghent, Belgium"
+        country = location.strip().title()
+        return [f"{keyword} {city}, {country}" for city in cities]
+
+    # City-level: modifiers
     return [
         f"{keyword} {location}",
         f"{keyword} {location} center",
