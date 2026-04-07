@@ -31,7 +31,7 @@ Examples:
     parser.add_argument("--max",      "-m", type=int, default=100, help="Max results (default: 100)")
     parser.add_argument("--no-email", action="store_true",  help="Skip website email scraping (faster)")
     parser.add_argument("--jsonl",    action="store_true",  help="Also export JSONL alongside CSV")
-    parser.add_argument("--output",   "-o", type=str, default=".", help="Output directory (default: .)")
+    parser.add_argument("--output",   "-o", type=str, default="output", help="Output directory (default: output/)")
     return parser.parse_args()
 
 
@@ -56,10 +56,8 @@ def main() -> None:
         log.warning("No leads collected — check your keyword, location, or API key.")
         return
 
-    os.makedirs(args.output, exist_ok=True)
-
     csv_path = export_to_csv(leads, keyword, location, output_dir=args.output)
-    print(f"\nDone! {len(leads)} leads saved to: {csv_path}")
+    print(f"\nDone! CSV → {csv_path}")
 
     if args.jsonl:
         jsonl_path = export_to_jsonl(leads, keyword, location, output_dir=args.output)
