@@ -10,12 +10,60 @@ Public API:
 Mode selection (automatic):
     - GOOGLE_MAPS_API_KEY set in .env  →  Google Places API  (faster, more reliable)
     - No API key                       →  Playwright scraper  (free, no account needed)
+
+Scale strategy:
+    Google Maps caps each search at ~60 results. To reliably hit max_results > 60,
+    generate_leads automatically runs multiple sub-queries (with area/direction
+    modifiers) and merges the results until the target count is reached.
 """
 
 from leadgen.config import GOOGLE_MAPS_API_KEY, log
 from leadgen.email_scraper import scrape_email_from_website
 from leadgen.exporter import export_to_csv, export_to_jsonl, to_records
 
+
+# ---------------------------------------------------------------------------
+# Sub-query generation (for breaking the ~60-result cap)
+# ---------------------------------------------------------------------------
+
+def _sub_queries(keyword: str, location: str) -> list[str]:
+    """
+    Return a list of search queries that together cover more of the location.
+    The first entry is always the plain query; the rest are progressively
+    more specific, used only when the plain search falls short of max_results.
+    """
+    return [
+        f"{keyword} {location}",
+        f"{keyword} {location} center",
+        f"{keyword} {location} north",
+        f"{keyword} {location} south",
+        f"{keyword} {location} east",
+        f"{keyword} {location} west",
+        f"best {keyword} {location}",
+        f"top {keyword} {location}",
+        f"{keyword} near {location}",
+        f"cheap {keyword} {location}",
+        f"popular {keyword} {location}",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Deduplication helper
+# ---------------------------------------------------------------------------
+
+def _dedup(leads: list[dict], seen: set[tuple]) -> tuple[list[dict], set[tuple]]:
+    unique = []
+    for lead in leads:
+        key = (lead["name"].lower().strip(), lead["address"].lower().strip())
+        if key not in seen:
+            seen.add(key)
+            unique.append(lead)
+    return unique, seen
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def generate_leads(
     keyword: str,
@@ -27,65 +75,92 @@ def generate_leads(
     Collect business leads from Google Maps.
 
     Automatically uses the Places API when GOOGLE_MAPS_API_KEY is set,
-    otherwise falls back to the Playwright browser scraper (free, no key needed).
+    otherwise uses the Playwright browser scraper (free, no account needed).
+
+    Runs multiple sub-queries (area modifiers) until max_results is reached,
+    so asking for 100 actually returns 100 when available.
 
     Args:
         keyword:       Search term  (e.g. "dentist", "restaurant")
         location:      Target area  (e.g. "Brussels", "New York")
-        max_results:   Cap on unique leads to return (default 100)
+        max_results:   Target number of unique leads (default 100)
         scrape_emails: If True, visit each website to find a contact email
 
     Returns:
         List of dicts with keys:
         name, address, phone, website, email, rating, category, maps_url, city
     """
-    log.info("=== Lead generation: %r in %r (max %d) ===", keyword, location, max_results)
+    log.info("=== Lead generation: %r in %r (target %d) ===", keyword, location, max_results)
 
-    # ── Choose extraction backend ────────────────────────────────────────────
+    leads: list[dict] = []
+    seen:  set[tuple] = set()
+    queries = _sub_queries(keyword, location)
+
     if GOOGLE_MAPS_API_KEY:
         log.info("Mode: Google Places API")
         from leadgen.maps_client import collect_place_ids, fetch_lead
 
-        place_ids = collect_place_ids(keyword, location, max_results)
-        log.info("Found %d place IDs — fetching details…", len(place_ids))
+        for query_idx, query in enumerate(queries):
+            if len(leads) >= max_results:
+                break
 
-        raw_leads: list[dict] = []
-        for i, place_id in enumerate(place_ids, 1):
-            log.info("[%d/%d] place_id=%s", i, len(place_ids), place_id)
-            try:
-                raw_leads.append(fetch_lead(place_id))
-            except Exception as exc:
-                log.warning("  Detail fetch failed: %s", exc)
+            needed = max_results - len(leads)
+            # Extract keyword+location from the composite query for the API
+            q_keyword, _, q_location = query.partition(" ")
+            log.info("Sub-query %d/%d: %r (need %d more)", query_idx + 1, len(queries), query, needed)
+
+            place_ids = collect_place_ids(q_keyword, q_location or location, needed)
+
+            for i, place_id in enumerate(place_ids, 1):
+                if len(leads) >= max_results:
+                    break
+                log.info("  [%d/%d] place_id=%s", i, len(place_ids), place_id)
+                try:
+                    raw = fetch_lead(place_id)
+                    new, seen = _dedup([raw], seen)
+                    leads.extend(new)
+                except Exception as exc:
+                    log.warning("  Detail fetch failed: %s", exc)
 
     else:
         log.info("Mode: Playwright scraper (no API key found)")
         from leadgen.scraper import scrape_google_maps
-        raw_leads = scrape_google_maps(keyword, location, max_results)
 
-    # ── Deduplicate ──────────────────────────────────────────────────────────
-    leads: list[dict] = []
-    seen: set[tuple]  = set()
+        for query_idx, query in enumerate(queries):
+            if len(leads) >= max_results:
+                break
 
-    for lead in raw_leads:
-        key = (lead["name"].lower().strip(), lead["address"].lower().strip())
-        if key in seen:
-            log.debug("  Duplicate — skipping: %s", lead["name"])
-            continue
-        seen.add(key)
-        leads.append(lead)
+            needed = max_results - len(leads)
+            log.info(
+                "Sub-query %d/%d: %r (have %d/%d, need %d more)",
+                query_idx + 1, len(queries), query, len(leads), max_results, needed,
+            )
 
-    log.info("After dedup: %d unique leads.", len(leads))
+            # Split composite query back into keyword / location for the scraper
+            parts  = query.split(" ", 1)
+            q_kw   = parts[0]
+            q_loc  = parts[1] if len(parts) > 1 else location
+
+            raw = scrape_google_maps(q_kw, q_loc, needed)
+            new, seen = _dedup(raw, seen)
+            leads.extend(new)
+            log.info("  Sub-query yielded %d new leads (total %d)", len(new), len(leads))
+
+            if not new:
+                log.info("  No new results from this sub-query — moving on.")
+
+    log.info("Collection complete: %d unique leads.", len(leads))
 
     # ── Email enrichment ─────────────────────────────────────────────────────
     if scrape_emails:
-        for lead in leads:
-            if lead.get("email") or not lead.get("website"):
-                continue
-            log.info("  Scraping email from %s…", lead["website"])
+        to_enrich = [l for l in leads if not l.get("email") and l.get("website")]
+        log.info("Scraping emails for %d leads with a website…", len(to_enrich))
+        for lead in to_enrich:
+            log.info("  Scraping %s…", lead["website"])
             try:
                 lead["email"] = scrape_email_from_website(lead["website"])
                 if lead["email"]:
-                    log.info("  Email found: %s", lead["email"])
+                    log.info("  Found: %s", lead["email"])
             except Exception as exc:
                 log.debug("  Email scrape error: %s", exc)
 

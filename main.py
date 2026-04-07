@@ -57,7 +57,10 @@ def main() -> None:
         return
 
     csv_path = export_to_csv(leads, keyword, location, output_dir=args.output)
-    print(f"\nDone! CSV → {csv_path}")
+    if csv_path:
+        print(f"\nDone! New leads → {csv_path}")
+    else:
+        print("\nNo new leads — all results already exist in a previous export.")
 
     if args.jsonl:
         jsonl_path = export_to_jsonl(leads, keyword, location, output_dir=args.output)
