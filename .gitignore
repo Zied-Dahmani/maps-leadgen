@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Environment / secrets
+.env
+
+# Output files
+*.csv
+*.jsonl
+
+# OS
+.DS_Store
